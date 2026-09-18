@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  backend:
+    build: .
+    ports:
+      - "9000:9000"  
+    env_file:
+      - .env
+    environment:
+      PORT: 9000
+    networks:
+      - outbox-network  
+
+networks:
+  outbox-network:
+    external: true

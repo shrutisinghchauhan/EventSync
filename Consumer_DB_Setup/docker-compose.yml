@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: postgres_consumer
+
+    restart: always
+
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: consumer_db
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - consumer_pgdata:/var/lib/postgresql/data
+
+    networks:
+      - outbox-network
+
+volumes:
+  consumer_pgdata:
+
+networks:
+  outbox-network:
+    external: true

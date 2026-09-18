@@ -1,0 +1,24 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Events_consumed {
+  id          String   @id @default(cuid())
+  order_id    String
+  topic       String
+  partition   Int
+  offset      String
+  order_event Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Processed_Event {
+  order_id  String   @id
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

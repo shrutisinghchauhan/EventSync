@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Order {
+  id           String   @id @default(cuid())
+  customerName String
+  productName  String
+  Pattern_Type String
+  quantity     Int
+  status       String   @default("CREATED")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Outbox_Transactional_Outbox {
+  id             String    @id(map: "Outbox_pkey") @default(cuid())
+  payload        Json
+  status         String
+  simulationMode String    @default("PROBABILISTIC")
+  failureRate    Float     @default(0)
+  requestIndex   Int?
+  attempts       Int       @default(0)
+  lastError      String?
+  processedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+model Outbox_Listen_To_yourself {
+  id             String    @id @default(cuid())
+  payload        Json
+  status         String
+  simulationMode String    @default("PROBABILISTIC")
+  failureRate    Float     @default(0)
+  requestIndex   Int?
+  attempts       Int       @default(0)
+  lastError      String?
+  processedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+model ProcessedEvent {
+  eventId   String   @id
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

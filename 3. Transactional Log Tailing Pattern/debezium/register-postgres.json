@@ -1,0 +1,23 @@
+{
+  "name": "postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres_outbox",
+    "database.port": "5432",
+    "database.user": "myuser",
+    "database.password": "mypassword",
+    "database.dbname": "outbox_db",
+    "topic.prefix": "postgres",
+    "plugin.name": "pgoutput",
+    "table.include.list": "public.Order",
+    "transforms": "filter,route",
+    
+    "transforms.filter.type": "io.debezium.transforms.Filter",
+    "transforms.filter.language": "jsr223.groovy",
+    "transforms.filter.condition": "value.after != null && value.after.Pattern_Type == 'Transactional_Log_Tailing'",
+    
+    "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.route.regex": "postgres\\.public\\.Order",
+    "transforms.route.replacement": "Orders_3___Transactional_Log_Tailing"
+  }
+}
