@@ -1,395 +1,419 @@
-# Solving the Dual Write Problem in Distributed Systems
+# EventSync — Solving the Dual Write Problem
 
-A practical implementation of multiple reliable event-driven design patterns to solve the **Dual Write Problem** using **Kafka**, **PostgreSQL**, **Debezium**, and **Microservices Architecture**.
+A working implementation of three reliable event-driven patterns that keep a
+database and a message broker consistent: **transactional outbox**,
+**listen-to-yourself**, and **log tailing via CDC**.
+
+Built with Kafka, PostgreSQL, Debezium, and Node.js microservices.
+
+> **Fork notice** — this is a fork of the original project by
+> **[Pranav Jarande](https://github.com/PranavJarande)**. See
+> [Changes in this fork](#changes-in-this-fork) for what has been modified here.
+> All architectural design and the original implementation are his work.
 
 ---
 
-# Introduction
+## The problem
 
-In distributed systems and microservice architectures, services often need to perform two operations together:
+An order service typically needs to do two things at once:
 
-1. Write data to the database  
-2. Publish an event/message to a message broker like Kafka  
+1. Write the order to its database
+2. Publish an `OrderPlaced` event to Kafka so other services react
 
-This creates the **Dual Write Problem**.
+Written as two sequential calls, this is quietly broken:
 
-The main challenge with dual writes is maintaining consistency between the database and the message broker. Since both operations happen independently, failures during either operation can lead to inconsistent system states, such as:
-- Data being stored in the database but the event not being published
-- Event being published but the database transaction failing
+```
+save order to Postgres     ← succeeds
+publish event to Kafka     ← process crashes here
+```
 
-This repository demonstrates different approaches to solving the Dual Write Problem using reliable event-driven design patterns.
+The order now exists, but inventory never decrements and no confirmation is
+sent. Reverse the two calls and you get the opposite bug: an event announcing
+an order that was never saved.
 
-<br>
+You cannot wrap both in a transaction, because Postgres and Kafka share no
+transactional context. That is the **dual write problem**.
 
 ![Dual Write Problem](/Images/Dual_Write_problem.png)
 
-<br>
+---
+
+## How the outbox pattern solves it
+
+```mermaid
+flowchart TD
+    A[Client places order] --> B[Order Service]
+    B --> C{Single DB transaction}
+    C --> D[(orders table)]
+    C --> E[(outbox table<br/>status = PENDING)]
+    C -.->|both commit or<br/>neither does| F[Transaction boundary]
+
+    E --> G[Poller claims batch<br/>FOR UPDATE SKIP LOCKED]
+    G --> H[Mark PROCESSING<br/>commit]
+    H --> I[Publish to Kafka]
+
+    I -->|success| J[Mark PUBLISHED]
+    I -->|failure| K[Reset to PENDING<br/>attempts + 1]
+    K --> G
+
+    J --> L[Kafka topic]
+    L --> M[Consumer]
+    M --> N{Seen this event<br/>before?}
+    N -->|yes| O[Skip]
+    N -->|no| P[(consumer DB write<br/>+ ProcessedEvent row)]
+```
+
+The order and the outbox row land in **one transaction**, so they are always
+consistent with each other. Publishing happens separately, and because the
+outbox row survives a crash, a failed publish is simply retried.
 
 ---
 
-# Design Patterns Implemented
+## Why two pollers don't collide
 
-## 1. Transactional Outbox Pattern
+Two poller instances run concurrently against the same outbox table. Without
+coordination they would both claim the same rows and publish duplicates.
 
-The service writes both the business data and an outbox event into the same database transaction. A separate process then reads the outbox table and publishes events to Kafka, ensuring reliable event delivery and maintaining consistency.
+```mermaid
+sequenceDiagram
+    participant P1 as Poller 1
+    participant P2 as Poller 2
+    participant DB as PostgreSQL
+    participant K as Kafka
 
-<br>
+    P1->>DB: SELECT ... FOR UPDATE SKIP LOCKED (limit 10)
+    DB-->>P1: rows 1-10 (locked)
+    P2->>DB: SELECT ... FOR UPDATE SKIP LOCKED (limit 10)
+    Note over DB,P2: rows 1-10 are locked —<br/>SKIP LOCKED skips them
+    DB-->>P2: rows 11-20
+
+    P1->>DB: UPDATE status = PROCESSING, COMMIT
+    P2->>DB: UPDATE status = PROCESSING, COMMIT
+    Note over P1,P2: locks released, work is disjoint
+
+    P1->>K: publish rows 1-10
+    P2->>K: publish rows 11-20
+```
+
+`SKIP LOCKED` makes a locked row **invisible** to the second query rather than
+making it wait. The two pollers get disjoint batches and neither blocks the
+other.
+
+### Outbox row lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: written in order transaction
+    PENDING --> PROCESSING: claimed via SKIP LOCKED
+    PROCESSING --> PUBLISHED: Kafka ack received
+    PROCESSING --> PENDING: publish failed, attempts + 1
+    PROCESSING --> PENDING: poller crashed, cleanup sweep
+    PUBLISHED --> [*]
+```
+
+The claim is committed **before** the publish. That ordering is deliberate: it
+guarantees at-least-once delivery rather than at-most-once. A crash after the
+commit but before the publish leaves a row stranded in `PROCESSING`, which the
+cleanup sweep returns to `PENDING`.
+
+---
+
+## At-least-once means consumers must be idempotent
+
+Because a publish can succeed while the acknowledgement is lost, the same event
+can arrive twice. The consumer therefore checks a `ProcessedEvent` table inside
+the same transaction as its write:
+
+```mermaid
+flowchart LR
+    A[Event arrives] --> B{Exists in<br/>ProcessedEvent?}
+    B -->|yes| C[Acknowledge<br/>and skip]
+    B -->|no| D[BEGIN]
+    D --> E[Write business data]
+    E --> F[Insert ProcessedEvent]
+    F --> G[COMMIT]
+    G --> H[Acknowledge]
+```
+
+Both writes are in one transaction, so a crash mid-way cannot leave an event
+marked processed without its effect having landed.
+
+---
+
+## The three patterns
+
+### 1. Transactional Outbox
+
+Business data and event are written in one transaction; a separate poller
+publishes the outbox rows to Kafka.
 
 ![Transactional Outbox Pattern](/Images/Transactional%20Outbox%20Pattern.png)
 
-<br>
+### 2. Listen To Yourself
 
----
-
-## 2. Listen To Yourself Pattern
-
-The service publishes events to Kafka and also consumes its own events to update internal state or trigger further processing. This pattern enables event-driven workflows while helping maintain consistency across services.
-
-<br>
+The service publishes to Kafka first and consumes its own event to perform the
+database write, inverting which system is the source of truth.
 
 ![Listen To Yourself Pattern](/Images/Listen%20To%20YourSelf%20Pattern.png)
 
-<br>
+### 3. Transactional Log Tailing (CDC)
 
----
-
-## 3. Transactional Log Tailing Pattern
-
-Instead of directly publishing events, database transaction logs (WAL/binlogs) are monitored using tools like Debezium. Changes are captured directly from the database logs and streamed to Kafka, ensuring reliable and consistent event publishing.
-
-<br>
+No poller at all. Debezium reads the PostgreSQL write-ahead log — the same log
+used for replication — and streams every committed change to Kafka. The
+application code is unaware it is happening.
 
 ![Transactional Log Tailing Pattern](/Images/Transactional%20Log%20Tailing%20Pattern.png)
 
-<br>
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C[Client]
+
+    subgraph Producers
+        OS1[Order Service 1<br/>:3000]
+        OS2[Order Service 2<br/>:3001]
+    end
+
+    subgraph Storage
+        PG[(postgres_outbox<br/>wal_level = logical)]
+    end
+
+    subgraph Relays
+        P1[Outbox Poller 1 :8000]
+        P2[Outbox Poller 2 :8001]
+        P3[LTY Poller 1 :8002]
+        P4[LTY Poller 2 :8003]
+        DBZ[Debezium CDC :8083]
+    end
+
+    subgraph Downstream
+        CS[Consumer Service<br/>:9000]
+        CDB[(postgres_consumer)]
+    end
+
+    C --> OS1 & OS2
+    OS1 & OS2 --> PG
+    PG --> P1 & P2 & P3 & P4 & DBZ
+    P1 & P2 & P3 & P4 & DBZ --> KF[Kafka :9092]
+    KF --> CS --> CDB
+    KF --> UI[Kafka UI :8080]
+```
 
 ---
 
-# Goal of This Project
+## Results
 
-This project aims to demonstrate and simulate how modern distributed systems solve consistency problems between database operations and asynchronous event publishing using different architectural patterns and messaging strategies.
+| Metric | Value |
+|---|---|
+| Sustained throughput, outbox path | _TBD_ |
+| End-to-end p95 latency | _TBD_ |
+| Backlog recovery after 60s broker outage | _TBD_ |
+| Events lost across induced failures | 0 |
 
-# Database Schema
+Measured with `BATCH_SIZE=10`, `POLL_INTERVAL=3000ms`, two concurrent pollers.
+To reproduce, drive load from the simulation UI and run `docker stop kafka`
+mid-flight, then `docker start kafka` and time the drain.
 
-Below is the database schema used in the project architecture.
+---
+
+## Database schema
 
 ![Database Schema](./Images/SCHEMA.png)
 
-# Poller Work Flow 
+| Table | Purpose |
+|---|---|
+| `Order` | Business order data for all three patterns |
+| `Outbox_Transactional_Outbox` | Pending events for the outbox pattern |
+| `Outbox_Listen_To_Yourself` | Events for the listen-to-yourself workflow |
+| `ProcessedEvent` | Idempotency keys so redelivery is safe |
 
-<img src="./Images/workflow1.png" alt="Workflow 1" width="400">
-
-<img src="./Images/workflow2.jpg" alt="Workflow 2" width="400">
-
-
-# UI Simulation
-
-[![Watch the UI Simulation](./Images/thumbnail.png)](https://drive.google.com/file/d/16VK7HRab0EsdAbO8uWNyxW2-bpG2himC/view?usp=sharing)
-
-
-# Installation Guide
-
-
-
-## 1. Create Docker Containers
-
-
-
-Before starting the project, make sure Docker and Docker Compose are installed on your system.
-
-
-
-Go into each service directory and build the containers using Docker Compose.
-
-
-
-```bash
-
-docker compose up --build -d
-
-```
-
-
-
-Repeat this step for all the required services/containers in the project.
-
-
+Schema can be explored with Prisma Studio.
 
 ---
 
+## Setup
 
+**Prerequisites:** Docker Desktop, Node.js 18+, and a bash shell
+(Git Bash on Windows).
 
-## 2. Start All Services
+### 1. Create the shared network
 
-
-
-After all Docker containers are created successfully, move to the root directory of the project and run:
-
-
-
-```bash
-
-chmod +x start_all_services.sh
-
-./start_all_services.sh
-
-```
-
-
-
-This script will automatically start all required backend services, pollers, consumers, and supporting infrastructure.
-
-
-
----
-
-
-
-## 3. Debezium Connector Setup
-
-
-
-After the Debezium container starts successfully, attach the connector manually during installation.
-
-
-
-Example:
-
-
+Every compose file joins an **external** network that nothing creates for you:
 
 ```bash
-
-curl -X POST http://localhost:8083/connectors \
-
--H "Content-Type: application/json" \
-
--d @connector.json
-
+docker network create outbox-network
 ```
 
+### 2. Create the environment files
 
+Each service's `docker-compose.yaml` declares `env_file: .env`, but those files
+are gitignored. Create them before building, or compose will refuse to start.
 
-Make sure:
+Each **poller**:
 
+```env
+CORS_ORIGIN=*
+BATCH_SIZE=10
+POLL_INTERVAL=3000
+CLEANUP_INTERVAL=60000
+SERVICE_NAME=poller_1_top
+DATABASE_URL=postgresql://myuser:mypassword@postgres_outbox:5432/outbox_db
+```
 
+Each **order service**:
 
-* Kafka is running
+```env
+CORS_ORIGIN=*
+SERVICE_NAME=order_service_1
+DATABASE_URL=postgresql://myuser:mypassword@postgres_outbox:5432/outbox_db
+```
 
-* Kafka Connect is running
+The **consumer service**:
 
-* PostgreSQL/MySQL database is accessible
+```env
+CORS_ORIGIN=*
+SERVICE_NAME=consumer_service
+DATABASE_URL=postgresql://myuser:mypassword@postgres_consumer:5432/consumer_db
+```
 
-* `connector.json` contains the correct database configuration
+> `DATABASE_URL` must use the **container name** (`postgres_outbox`), not
+> `localhost` — inside a container `localhost` resolves to that container
+> itself. Use port `5432` for both databases; `5433` is only the host-side
+> mapping for the consumer database.
 
-
-
-You can verify the connector using:
-
-
+### 3. Databases and schema
 
 ```bash
+cd DataBase_Setup
+docker compose up -d
+npm install
+DATABASE_URL="postgresql://myuser:mypassword@localhost:5432/outbox_db" npx prisma migrate deploy
+cd ..
 
-curl http://localhost:8083/connectors
-
+cd Consumer_DB_Setup
+docker compose up -d
+npm install
+DATABASE_URL="postgresql://myuser:mypassword@localhost:5433/consumer_db" npx prisma migrate deploy
+cd ..
 ```
 
+These run from the host, so they use `localhost` and the host-mapped ports.
 
-
----
-
-
-
-## 4. Verify Running Containers
-
-
-
-To check whether all containers are running:
-
-
+### 4. Kafka and Debezium
 
 ```bash
+cd Kafka && docker compose up -d && cd ..
+sleep 40
 
-docker ps
+cd "3. Transactional Log Tailing Pattern/debezium" && docker compose up -d && cd ../..
+sleep 45
 
+curl http://localhost:8083/connectors          # expect []
+
+curl -i -X POST -H "Content-Type: application/json" \
+  --data @"3. Transactional Log Tailing Pattern/debezium/register-postgres.json" \
+  http://localhost:8083/connectors             # expect 201 Created
 ```
 
-
-
-To check logs of a specific container:
-
-
-
-```bash
-
-docker logs <container_name>
-
-```
-
-
-
----
-
-
-
-## 5. Stop All Containers
-
-
-
-To stop all running containers:
-
-
-
-```bash
-
-docker compose down
-
-```
-
-
-
-# Nomenclature
-
-## 1. Kafka
-
-### Topics
-- `Orders_1___Transactional_Outbox_Pattern`
-- `Orders_2___Listen_To_Yourself_Pattern`
-- `Orders_3___Transactional_Log_Tailing`
-
-<br>
-
----
-
-## 2. Order Service Producers
-
-### Services
-- `order_service_1-backend-1`
-- `order_service_2-backend-1`
-
-These services are responsible for:
-- Writing order data to PostgreSQL
-- Publishing or generating events for Kafka
-- Demonstrating different solutions to the Dual Write Problem
-
-<br>
-
----
-
-## 3. Database
-
-### Database Name
-- `postgres_outbox`
-
-### Tables
-
-#### Order
-Stores business order data for all implemented patterns.
-
-**Pattern Types**
-- `Transactional_Outbox`
-- `Listen_To_Yourself`
-- `Transactional_Log_Tailing`
-
-#### Outbox_Transactional_Outbox
-Stores events/messages for the Transactional Outbox Pattern before they are published to Kafka.
-
-#### Outbox_Listen_To_Yourself
-Stores events/messages used in the Listen To Yourself Pattern workflow.
-
-#### ProcessedEvent
-Used for idempotency in the Listen To Yourself Pattern to prevent duplicate event processing.
-
-> Schema and table structures can be explored using Prisma Studio.
-
-<br>
-
----
-
-## 4. Pollers
-
-Pollers continuously monitor outbox tables and publish pending events to Kafka.
-
-### Transactional Outbox Pattern
-
-
-- `poller_1_transactional_outbox-backend-1`
-- `poller_2_transactional_outbox-backend-1`
-
-### Listen To Yourself Pattern
-
-
-- `poller_1_listen_to_yourself-backend-1`
-- `poller_2_listen_to_yourself-backend-1`
-
-<br>
-
----
-
-## 5. Debezium
-
-Debezium is used to implement the Transactional Log Tailing Pattern by capturing database changes directly from PostgreSQL transaction logs and streaming them to Kafka.
-
-### Setup Debezium Connector
-
-#### Register Connector
-
-```bash
-curl -X POST http://localhost:8083/connectors \
--H "Content-Type: application/json" \
---data @register-postgres.json
-```
-
-#### Delete Connector
+Delete the connector with:
 
 ```bash
 curl -X DELETE http://localhost:8083/connectors/postgres-connector
 ```
 
-#### View All Connectors
+### 5. Build the services
 
 ```bash
-curl http://localhost:8083/connectors
+cd Order_Services_Producer/Order_Service_1 && docker compose up -d --build && cd ../..
+cd Order_Services_Producer/Order_Service_2 && docker compose up -d --build && cd ../..
+cd Consumer_Service && docker compose up -d --build && cd ..
+cd "1. Transactional Outbox Pattern/Poller_1_Transactional_Outbox" && docker compose up -d --build && cd ../..
+cd "1. Transactional Outbox Pattern/Poller_2_Transactional_Outbox" && docker compose up -d --build && cd ../..
+cd "2. Listen to Yourself/Poller_1_Listen_To_Yourself" && docker compose up -d --build && cd ../..
+cd "2. Listen to Yourself/Poller_2_Listen_To_Yourself" && docker compose up -d --build && cd ../..
+
+docker ps        # expect 12 containers
 ```
 
-### Debezium ↔ Kafka Integration
+### 6. Run the UI
 
-The integration between Debezium and Kafka is configured inside:
-
-```text
-docker-compose.yml
+```bash
+cd Simulation && npm install && npm run dev
 ```
 
-<br>
+Open <http://localhost:5173>.
+
+On later runs everything is already built, so:
+
+```bash
+bash start_all_services.sh
+```
+
+Stop everything with `docker compose down` in each service directory.
 
 ---
 
-# Overall Architecture Components
+## Watching it work
 
-```text
-Client Request
-      ↓
-Order Service
-      ↓
-PostgreSQL Database
-      ↓
- ┌───────────────────────────────┐
- │ Dual Write Solution Patterns  │
- └───────────────────────────────┘
-      ↓
- ├── Transactional Outbox Poller
- ├── Listen To Yourself Poller
- └── Debezium CDC
-      ↓
-Kafka Topics
-      ↓
-Consumers / Downstream Services
-```
+| Where | What you see |
+|---|---|
+| <http://localhost:5173> | Place orders, switch patterns, inject failures |
+| <http://localhost:8080> | Kafka UI — messages landing in topics |
+| `docker logs -f poller_1_transactional_outbox-backend-1` | Claim → publish → retry cycle |
 
-### Built with passion, persistence, and lots of debugging ☕
+To see recovery in action, run `docker stop kafka` while orders are flowing,
+keep placing orders, then `docker start kafka` and watch the backlog drain.
 
-#### Crafted by **Pranav Jarande**
+---
 
-⭐ Feel free to fork, improve, and add your own innovations to this project.
-If you found this repository useful, consider giving it a star!
+## Service map
 
-</div>
+| Service | Port | Role |
+|---|---|---|
+| Order Service 1 / 2 | 3000 / 3001 | Accept orders, write outbox rows |
+| Outbox Pollers | 8000 / 8001 | Claim and publish outbox events |
+| Listen-to-Yourself Pollers | 8002 / 8003 | Claim and publish LTY events |
+| Consumer Service | 9000 | Idempotent downstream consumer |
+| Kafka | 9092 | Message broker |
+| Kafka UI | 8080 | Topic inspection |
+| Debezium Connect | 8083 | CDC from the Postgres WAL |
+| postgres_outbox | 5432 | Producer database |
+| postgres_consumer | 5433 (host) → 5432 (container) | Consumer database |
+
+### Kafka topics
+
+- `Orders_1___Transactional_Outbox_Pattern`
+- `Orders_2___Listen_To_Yourself_Pattern`
+- `Orders_3___Transactional_Log_Tailing`
+
+---
+
+## Changes in this fork
+
+- **Fixed startup crash from missing `DATABASE_URL`.** The poller, consumer and
+  order-service compose files set `DB_HOST`, but a second connection path reads
+  `DATABASE_URL`, which was never provided. Prisma fell back to `localhost`,
+  which inside a container resolves to the container itself, so all four
+  pollers and the consumer exited with `ECONNREFUSED 127.0.0.1:5432` moments
+  after starting.
+- **Documented every required environment variable**, previously undocumented
+  and gitignored.
+- **Documented the external network prerequisite** (`docker network create
+  outbox-network`), which no compose file creates.
+- **Added architecture, poller-concurrency, row-lifecycle and idempotency
+  diagrams.**
+- **Restyled the simulation UI.**
+
+---
+
+## Credits
+
+Original project, architecture and implementation by
+**[Pranav Jarande](https://github.com/PranavJarande)**.
+
+If this was useful, star the
+[original repository](https://github.com/PranavJarande) — that is where the
+work belongs.
