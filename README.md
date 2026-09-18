@@ -6,11 +6,6 @@ database and a message broker consistent: **transactional outbox**,
 
 Built with Kafka, PostgreSQL, Debezium, and Node.js microservices.
 
-> **Fork notice** — this is a fork of the original project by
-> **[Pranav Jarande](https://github.com/PranavJarande)**. See
-> [Changes in this fork](#changes-in-this-fork) for what has been modified here.
-> All architectural design and the original implementation are his work.
-
 ---
 
 ## The problem
@@ -388,32 +383,3 @@ keep placing orders, then `docker start kafka` and watch the backlog drain.
 - `Orders_1___Transactional_Outbox_Pattern`
 - `Orders_2___Listen_To_Yourself_Pattern`
 - `Orders_3___Transactional_Log_Tailing`
-
----
-
-## Changes in this fork
-
-- **Fixed startup crash from missing `DATABASE_URL`.** The poller, consumer and
-  order-service compose files set `DB_HOST`, but a second connection path reads
-  `DATABASE_URL`, which was never provided. Prisma fell back to `localhost`,
-  which inside a container resolves to the container itself, so all four
-  pollers and the consumer exited with `ECONNREFUSED 127.0.0.1:5432` moments
-  after starting.
-- **Documented every required environment variable**, previously undocumented
-  and gitignored.
-- **Documented the external network prerequisite** (`docker network create
-  outbox-network`), which no compose file creates.
-- **Added architecture, poller-concurrency, row-lifecycle and idempotency
-  diagrams.**
-- **Restyled the simulation UI.**
-
----
-
-## Credits
-
-Original project, architecture and implementation by
-**[Pranav Jarande](https://github.com/PranavJarande)**.
-
-If this was useful, star the
-[original repository](https://github.com/PranavJarande) — that is where the
-work belongs.
